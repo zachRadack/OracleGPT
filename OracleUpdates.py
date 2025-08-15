@@ -56,6 +56,12 @@ import re, zipfile, xml.etree.ElementTree as ET
 from typing import List, Optional, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from tqdm import tqdm
+import contextlib
+
+try:  # httpx used only when we need explicit proxy / custom CA handling for OpenAI
+    import httpx  # type: ignore
+except Exception:  # pragma: no cover - optional
+    httpx = None
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -67,7 +73,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from openai import OpenAI
 #from openai.types.chat.completion_create_params import ResponseFormat
 
-DEFAULT_EXCEL = "/mnt/data/Feature_Summary_8_13_2025.xlsx"
+# In a container context we'll typically mount a host folder to /data. Provide a saner default
+# (the user can override with --excel). Leaving the original example in the top comment.
+DEFAULT_EXCEL = "/data/Feature_Summary.xlsx"
 
 
 @dataclass
@@ -302,8 +310,14 @@ def _extract_links_via_zip(
         return links
 
 
-def make_driver(headless: bool = True) -> webdriver.Chrome:
-    """Spin up a Selenium Chrome driver (headless optional)."""
+def make_driver(headless: bool = True, proxy: Optional[str] = None, insecure: bool = False) -> webdriver.Chrome:
+    """Spin up a Selenium Chrome driver (headless optional, with optional proxy / insecure flags).
+
+    Args:
+        headless: run Chrome in headless mode.
+        proxy: proxy URL like http://user:pass@host:port or socks5://host:1080 .
+        insecure: if True, ignore certificate errors (NOT recommended for production; last resort).
+    """
     options = ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
@@ -315,6 +329,12 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
     options.add_argument("--disable-extensions")
     options.add_argument("--remote-allow-origins=*")
     options.add_argument("--lang=en-US")
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+    if insecure:
+        # Corporate TLS inspection sometimes breaks Chrome if root CA not installed; this bypasses verification.
+        # Prefer adding the custom root CA instead of using this.
+        options.add_argument("--ignore-certificate-errors")
 
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(60)
@@ -375,16 +395,30 @@ def fetch_page(driver: webdriver.Chrome, url: str) -> Tuple[str, str]:
     return extract_main_text_from_html(html)
 
 
-def gpt5_client() -> OpenAI:
-    """Create an OpenAI client instance.
+def gpt5_client(proxy: Optional[str] = None, ca_bundle: Optional[str] = None) -> OpenAI:
+    """Create an OpenAI client instance, honoring optional proxy and custom CA bundle.
 
-    (Very thin wrapper, but having a function makes it testable / injectable if needed.)
+    The OpenAI Python SDK already respects HTTPS_PROXY / HTTP_PROXY env vars. We only build a
+    custom httpx client if we explicitly need to force a proxy or CA file. This helps inside
+    locked-down networks where TLS interception causes EOF / protocol violations.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        # Fail fast with a clear message—no point continuing.
         raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-    return OpenAI()
+
+    client_kwargs = {}
+    if proxy or ca_bundle:
+        if httpx is None:
+            raise RuntimeError("httpx not available to configure proxy/CA; install httpx or remove --proxy/--ca-bundle")
+        verify: Optional[object]
+        if ca_bundle:
+            verify = ca_bundle  # path to PEM bundle
+        else:
+            verify = True
+        # Allow environment variables to still complement configuration.
+        http_client = httpx.Client(proxies=proxy, verify=verify, timeout=60.0)
+        client_kwargs["http_client"] = http_client
+    return OpenAI(**client_kwargs)
 
 
 # JSON schema to enforce a consistent, parseable summary structure
@@ -588,6 +622,10 @@ def main():
     parser.add_argument("--sheet", default=None, help="Sheet name (defaults to active sheet).")
     parser.add_argument("--out", default="oracle_update_summary.md", help="Output Markdown filename.")
     parser.add_argument("--headless", action="store_true", help="Run Chrome headless.")
+    parser.add_argument("--proxy", default=None, help="Proxy URL for outbound HTTP/S (e.g. http://user:pass@host:port). Overrides HTTPS_PROXY env var if set.")
+    parser.add_argument("--no-proxy", default=None, help="Comma-separated hosts to bypass proxy (adds to NO_PROXY env during run).")
+    parser.add_argument("--ca-bundle", default=None, help="Path to custom CA bundle PEM (mounted inside container). Sets SSL_CERT_FILE & REQUESTS_CA_BUNDLE.")
+    parser.add_argument("--insecure", action="store_true", help="Ignore TLS certificate errors in Chrome ONLY (last resort; prefer --ca-bundle).")
     parser.add_argument(
         "--limit", type=int, default=None, help="Max number of links to process (debug / faster trial)."
     )
@@ -597,6 +635,24 @@ def main():
     args = parser.parse_args()
 
     _setup_logger(args.verbose)
+
+    # Proxy / CA handling early so all later libs see env vars.
+    proxy = args.proxy or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    if args.no_proxy:
+        existing = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+        merged = ",".join(filter(None, [existing, args.no_proxy]))
+        os.environ["NO_PROXY"] = merged
+    if args.ca_bundle:
+        # Point Python / requests / httpx to custom CA
+        os.environ["SSL_CERT_FILE"] = args.ca_bundle
+        os.environ["REQUESTS_CA_BUNDLE"] = args.ca_bundle
+    if proxy:
+        # Populate standard envs so any library (selenium downloads etc.) can reuse
+        os.environ.setdefault("HTTPS_PROXY", proxy)
+        os.environ.setdefault("HTTP_PROXY", proxy)
+        logging.info("Using proxy: %s", proxy)
+    if args.ca_bundle:
+        logging.info("Using custom CA bundle: %s", args.ca_bundle)
 
     # STEP 1: Extract links
     logging.info("Reading Excel and extracting links...")
@@ -610,9 +666,9 @@ def main():
 
     # STEP 2: Fetch pages with Selenium
     logging.info("Launching Selenium Chrome...")
-    driver = make_driver(headless=args.headless)
+    driver = make_driver(headless=args.headless, proxy=proxy, insecure=args.insecure)
 
-    client = gpt5_client()
+    client = gpt5_client(proxy=proxy, ca_bundle=args.ca_bundle)
     summaries: List[PageSummary] = []
 
     try:
@@ -642,10 +698,13 @@ def main():
                 )
                 continue  # move on; best-effort philosophy
     finally:
-        try:
+        with contextlib.suppress(Exception):
             driver.quit()
-        except Exception:
-            pass  # ignoring driver cleanup errors; not critical at this point
+        # Close custom http client if we created one
+        http_client = getattr(client, "_client", None)  # openai 1.x stores underlying
+        with contextlib.suppress(Exception):
+            if http_client and hasattr(http_client, "close"):
+                http_client.close()
 
     # STEP 3: Write report
     write_markdown(summaries, args.out)
