@@ -1,0 +1,190 @@
+import os
+import json
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+class SeleniumExtractor:
+    def __init__(self, headless=True):
+        self.headless = headless
+        self.driver = None
+        self.setup_driver()
+    
+    def setup_driver(self):
+        """Initialize the Chrome WebDriver with options"""
+        chrome_options = Options()
+        if self.headless:
+            chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-plugins")
+        chrome_options.add_argument("--disable-images")
+        chrome_options.add_argument("--disable-javascript")
+        chrome_options.add_argument("--disable-css")
+        
+        # Docker-specific Chrome options
+        chrome_options.add_argument("--remote-debugging-port=9222")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        
+        try:
+            # Try to use system Chrome first (for Docker)
+            chrome_binary = os.environ.get('CHROME_BIN')
+            if chrome_binary and os.path.exists(chrome_binary):
+                chrome_options.binary_location = chrome_binary
+                service = Service()
+            else:
+                # Fallback to webdriver-manager
+                service = Service(ChromeDriverManager().install())
+            
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            print(f"Error setting up Chrome driver: {e}")
+            # Try with webdriver-manager as fallback
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+    
+    def extract_content(self, url, timeout=10):
+        """
+        Extract content from the specified XPath
+        
+        Args:
+            url (str): The URL to scrape
+            timeout (int): Maximum time to wait for element to load
+            
+        Returns:
+            str: The HTML content from the XPath, or None if not found
+        """
+        try:
+            self.driver.get(url)
+            
+            # Wait for the element to be present
+            wait = WebDriverWait(self.driver, timeout)
+            element = wait.until(
+                EC.presence_of_element_located((By.XPATH, '//*[@id="contentContainer"]/article'))
+            )
+            
+            # Get the HTML content of the element
+            html_content = element.get_attribute('outerHTML')
+            return html_content
+            
+        except TimeoutException:
+            print(f"Timeout: Element not found within {timeout} seconds for URL: {url}")
+            return None
+        except NoSuchElementException:
+            print(f"Element not found for URL: {url}")
+            return None
+        except Exception as e:
+            print(f"Error extracting content from {url}: {str(e)}")
+            return None
+    
+    def extract_multiple_urls(self, features_data):
+        """
+        Extract content from multiple URLs based on features data
+        
+        Args:
+            features_data (list): List of feature dictionaries containing hyperlinks
+            
+        Returns:
+            list: List of dictionaries with extracted data
+        """
+        results = []
+        FeatureDataLength = len(features_data)
+        indexNumber = 0
+        for feature in features_data:
+            indexNumber += 1
+            if not feature.get('hyperlink'):
+                print(f"No hyperlink found for feature: {feature.get('feature', 'Unknown')}")
+                continue
+
+            print(f"Processing for File ({indexNumber}/{FeatureDataLength}): {feature.get('feature', 'Unknown feature')}")
+            html_content = self.extract_content(feature['hyperlink'])
+            
+            result = {
+                "Feature": feature.get('feature', 'Unknown'),
+                "Module": feature.get('Module'),
+                "Link": feature.get('hyperlink', 'Unknown'),
+                "impact": feature.get('impact_to_existing_processes'),
+                "delivery_enabled": feature.get('delivered_enabled'),
+                "HTML": html_content
+            }
+            
+            results.append(result)
+            
+            # Add a small delay between requests to be respectful
+            time.sleep(1)
+        
+        return results
+    
+    def close(self):
+        """Close the WebDriver"""
+        if self.driver:
+            self.driver.quit()
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.close()
+
+
+def save_quarterly_patch_data(data, output_dir):
+    """
+    Save the extracted data to quarterly_Patch_Data.json
+    
+    Args:
+        data (list): List of dictionaries with extracted data
+        output_dir (str): Directory to save the file
+    """
+    output_path = os.path.join(output_dir, 'quarterly_Patch_Data.json')
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    print(f"Saved {len(data)} entries to {output_path}")
+    return output_path
+
+
+def main():
+    """Main function to run the Selenium extraction"""
+    # Get the data directory
+    current_dir = os.path.dirname(__file__)
+    data_dir = os.path.join(current_dir, '..', 'data')
+    
+    # Load the features data
+    features_file = os.path.join(data_dir, 'features.json')
+    
+    try:
+        with open(features_file, 'r', encoding='utf-8') as f:
+            features_data = json.load(f)
+    except FileNotFoundError:
+        print(f"Features file not found: {features_file}")
+        print("Please run the main.py script first to generate features.json")
+        return
+    except json.JSONDecodeError as e:
+        print(f"Error reading features.json: {e}")
+        return
+    
+    # Extract data using Selenium
+    with SeleniumExtractor(headless=True) as extractor:
+        quarterly_data = extractor.extract_multiple_urls(features_data)
+    
+    # Save the results
+    save_quarterly_patch_data(quarterly_data, data_dir)
+
+
+if __name__ == "__main__":
+    main()
